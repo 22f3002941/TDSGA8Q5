@@ -201,8 +201,7 @@ def freeze(body):
             total_bytes = None
             package_digest = None
         else:
-            inventory, total_bytes, package_digest = \
-                inventory_result
+            inventory, total_bytes, package_digest = inventory_result
 
         unsupported_reason = candidate.get(
             "unsupportedReason"
@@ -219,26 +218,24 @@ def freeze(body):
                 )
 
         if candidate.get("loadable") is not True:
-            reason_codes.append("NOT_LOADABLE")
+            reason_codes.append(
+                "NOT_LOADABLE"
+            )
 
-        if (
-            candidate.get("calibrationDigest")
-            != calibration
-        ):
+        if candidate.get("calibrationDigest") != calibration:
             reason_codes.append(
                 "CALIBRATION_MISMATCH"
             )
 
-        if (
-            candidate.get("tokenizerDigest")
-            != tokenizer
-        ):
+        if candidate.get("tokenizerDigest") != tokenizer:
             reason_codes.append(
                 "TOKENIZER_MISMATCH"
             )
 
         if inventory_result is None:
-            reason_codes.append("INVALID_INPUT")
+            reason_codes.append(
+                "INVALID_INPUT"
+            )
 
         reason_codes = sorted_codes(reason_codes)
 
@@ -332,20 +329,63 @@ def load_freeze(freeze_id):
 
 
 def validate_candidate_manifest(candidate):
-    result = make_inventory(
-        candidate.get("files")
-    )
-
-    if result is None:
-        return False, None, None, None
-
-    inventory, total, digest = result
+    inventory = candidate.get("inventory")
+    total = candidate.get("totalBytes")
+    digest = candidate.get("packageDigest")
 
     if (
-        candidate.get("inventory") != inventory
-        or candidate.get("totalBytes") != total
-        or candidate.get("packageDigest") != digest
+        not isinstance(inventory, list)
+        or not safe_integer(total)
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(
+            not isinstance(x, dict)
+            or set(x.keys()) != {
+                "name",
+                "bytes",
+                "sha256"
+            }
+            or not isinstance(x["name"], str)
+            or not x["name"]
+            or not safe_integer(x["bytes"])
+            or not isinstance(x["sha256"], str)
+            or len(x["sha256"]) != 64
+            or any(
+                c not in "0123456789abcdef"
+                for c in x["sha256"]
+            )
+            for x in inventory
+        )
     ):
+        return False, None, None, None
+
+    expected_inventory = sorted(
+        inventory,
+        key=lambda x: x["name"].encode("utf-8")
+    )
+
+    if inventory != expected_inventory:
+        return False, inventory, total, digest
+
+    names = [
+        x["name"]
+        for x in inventory
+    ]
+
+    if len(names) != len(set(names)):
+        return False, inventory, total, digest
+
+    expected_total = sum(
+        x["bytes"]
+        for x in inventory
+    )
+
+    expected_digest = sha256_json(inventory)
+
+    if total != expected_total:
+        return False, inventory, total, digest
+
+    if digest != expected_digest:
         return False, inventory, total, digest
 
     return True, inventory, total, digest
@@ -365,11 +405,13 @@ def select_phase(body):
         or not candidates
         or not isinstance(rows, list)
         or not isinstance(policy, dict)
-        or not isinstance(latencies, dict)
     ):
         return {
             "error": "INVALID_INPUT"
         }, 400
+
+    if not isinstance(latencies, dict):
+        latencies = {}
 
     frozen = load_freeze(freeze_id)
 
@@ -381,16 +423,10 @@ def select_phase(body):
             "packageManifest": None
         }, 200
 
-    if candidates != frozen["candidates"]:
-        return {
-            "freezeId": freeze_id,
-            "selected": None,
-            "results": [],
-            "packageManifest": None
-        }, 200
-
     if (
-        not safe_integer(policy.get("maxBytes"))
+        not isinstance(policy.get("maxBytes"), int)
+        or isinstance(policy.get("maxBytes"), bool)
+        or not safe_integer(policy.get("maxBytes"))
         or not finite_unit(
             policy.get("aggregateFloor")
         )
@@ -421,17 +457,45 @@ def select_phase(body):
                 "error": "INVALID_INPUT"
             }, 400
 
-    names = [
-        x["name"]
-        for x in candidates
-    ]
+    names = []
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            return {
+                "error": "INVALID_INPUT"
+            }, 400
+
+        name = candidate.get("name")
+
+        if not isinstance(name, str) or not name:
+            return {
+                "error": "INVALID_INPUT"
+            }, 400
+
+        names.append(name)
+
+    if len(names) != len(set(names)):
+        return {
+            "error": "INVALID_INPUT"
+        }, 400
 
     if set(names) != set(policy["candidateOrder"]):
         return {
             "error": "INVALID_INPUT"
         }, 400
 
-    results = []
+    frozen_names = [
+        x["name"]
+        for x in frozen["candidates"]
+    ]
+
+    if (
+        len(frozen_names) != len(set(frozen_names))
+        or set(names) != set(frozen_names)
+    ):
+        return {
+            "error": "INVALID_INPUT"
+        }, 400
 
     order = {
         name: i
@@ -440,27 +504,26 @@ def select_phase(body):
         )
     }
 
+    frozen_by_name = {
+        x["name"]: x
+        for x in frozen["candidates"]
+    }
+
+    results = []
+
     for candidate in candidates:
         name = candidate["name"]
         reason_codes = []
 
-        frozen_candidate = next(
-            x for x in frozen["candidates"]
-            if x["name"] == name
-        )
+        frozen_candidate = frozen_by_name[name]
 
-        if (
-            candidate
-            != frozen_candidate
-        ):
+        if candidate != frozen_candidate:
             reason_codes.append(
                 "INVALID_LINEAGE"
             )
 
         manifest_ok, _, manifest_total, _ = \
-            validate_candidate_manifest(
-                candidate
-            )
+            validate_candidate_manifest(candidate)
 
         if not manifest_ok:
             reason_codes.append(
@@ -469,7 +532,6 @@ def select_phase(body):
 
         aggregate = None
         slices = {}
-
         prediction_ok = True
         slice_values = {}
 
@@ -502,7 +564,7 @@ def select_phase(body):
                 []
             ).append(correct)
 
-        if not prediction_ok:
+        if not prediction_ok or not rows:
             reason_codes.append(
                 "INVALID_PREDICTIONS"
             )
@@ -516,8 +578,7 @@ def select_phase(body):
                 12
             )
 
-            for slice_name, values in \
-                    slice_values.items():
+            for slice_name, values in slice_values.items():
                 slices[slice_name] = round(
                     sum(values) / len(values),
                     12
@@ -528,9 +589,7 @@ def select_phase(body):
                     "AGGREGATE_FLOOR"
                 )
 
-            for slice_name, floor in \
-                    required_slices.items():
-
+            for slice_name, floor in required_slices.items():
                 if slice_name not in slices:
                     reason_codes.append(
                         "MISSING_SLICE:" + slice_name
@@ -560,8 +619,9 @@ def select_phase(body):
             )
 
         admitted = (
-            candidate["status"] == "frozen"
+            candidate.get("status") == "frozen"
             and prediction_ok
+            and bool(rows)
             and manifest_ok
             and aggregate is not None
             and total_bytes is not None
@@ -572,13 +632,9 @@ def select_phase(body):
             and all(
                 s in slices and
                 slices[s] >= floor
-                for s, floor
-                in required_slices.items()
+                for s, floor in required_slices.items()
             )
-            and not any(
-                code == "INVALID_LINEAGE"
-                for code in reason_codes
-            )
+            and not reason_codes
         )
 
         results.append({
@@ -624,7 +680,7 @@ def select_phase(body):
 
     if winner:
         manifest = next(
-            x for x in candidates
+            x for x in frozen["candidates"]
             if x["name"] == winner["name"]
         )
 
