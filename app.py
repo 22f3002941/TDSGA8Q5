@@ -118,9 +118,9 @@ def validate_freeze_input(data: Dict[str, Any]) -> bool:
     if not isinstance(tok_digest, str) or not tok_digest:
         return False
 
-    # allowedUnsupportedReasons: list of non-empty unique strings
+    # allowedUnsupportedReasons: list of non-empty unique strings (may be empty)
     allowed = data.get("allowedUnsupportedReasons")
-    if not isinstance(allowed, list) or len(allowed) == 0:
+    if not isinstance(allowed, list):
         return False
     seen_reasons = set()
     for r in allowed:
