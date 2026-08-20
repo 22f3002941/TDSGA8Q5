@@ -5,15 +5,6 @@
 #
 # Run with:
 #   uvicorn app:app --reload
-#
-# This implementation follows the assignment spec closely:
-# - Validates inputs strictly
-# - Computes inventory, totalBytes, packageDigest exactly as specified
-# - Persists freeze responses by freezeId
-# - Enforces idempotent replay and FREEZE_ID_CONFLICT on mismatch
-# - In select phase, recomputes and validates manifest, policy, predictions
-# - Computes aggregate and slice accuracies, applies floors and limits
-# - Selects best admitted candidate by (totalBytes, latencyMs, candidateOrder)
 
 from __future__ import annotations
 
@@ -63,9 +54,6 @@ def compute_inventory(files: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Opti
       - inventory list sorted by filename, each item: {"name": ..., "bytes": ..., "sha256": ...}
       - totalBytes (sum) or None if invalid
       - packageDigest = SHA-256(compact JSON of inventory) or None if invalid
-
-    For this implementation, we assume all file strings are valid UTF-8
-    (FastAPI already validated JSON). If any issue arises, we return None for totals.
     """
     try:
         inventory_items = []
@@ -230,7 +218,6 @@ def process_freeze_candidate(
 
     # If files invalid (inventory empty and total_bytes None), mark invalid
     if total_bytes is None:
-        # Invalid files -> status invalid, inventory empty, totalBytes/packageDigest null
         return {
             "name": name,
             "status": "invalid",
@@ -248,9 +235,6 @@ def process_freeze_candidate(
             status = "invalid"
         else:
             status = "unsupported"
-        # "Any reason makes its status invalid" is interpreted as:
-        # if unsupportedReason exists and is allowed -> unsupported
-        # if unsupportedReason exists and not allowed -> invalid
     else:
         # No unsupportedReason: must be loadable and match digests
         if not loadable:
@@ -337,7 +321,11 @@ def handle_freeze(data: Dict[str, Any]) -> Response:
 
 def validate_select_structure(data: Dict[str, Any]) -> bool:
     """
-    Basic structural validation for select input.
+    Minimal structural validation for select input, per spec:
+    a select request without array `candidates` and `rows` plus an
+    object `policy` returns 400. Everything else (policy field values,
+    prediction values, latency values) is validated per-candidate inside
+    handle_select and surfaces as reason codes, not as a 400.
     """
     if not isinstance(data, dict):
         return False
@@ -371,55 +359,7 @@ def validate_select_structure(data: Dict[str, Any]) -> bool:
     if not isinstance(data["latencies"], dict):
         return False
 
-    # Additional policy checks (basic)
-    # maxBytes: non-negative int
-    if "maxBytes" not in policy:
-        return False
-    mb = policy["maxBytes"]
-    if not isinstance(mb, int) or mb < 0:
-        return False
-
-    # aggregateFloor: float in [0,1]
-    if "aggregateFloor" not in policy:
-        return False
-    af = policy["aggregateFloor"]
-    if not isinstance(af, (int, float)) or af < 0 or af > 1:
-        return False
-
-    # requiredSlices: dict mapping slice->floor in [0,1]
-    if "requiredSlices" not in policy:
-        return False
-    rs = policy["requiredSlices"]
-    if not isinstance(rs, dict):
-        return False
-    for sname, sfloor in rs.items():
-        if not isinstance(sname, str) or not sname:
-            return False
-        if not isinstance(sfloor, (int, float)) or sfloor < 0 or sfloor > 1:
-            return False
-
-    # maxLatencyMs: non-negative number
-    if "maxLatencyMs" not in policy:
-        return False
-    ml = policy["maxLatencyMs"]
-    if not isinstance(ml, (int, float)) or ml < 0:
-        return False
-
-    # candidateOrder: list of unique non-empty strings
-    if "candidateOrder" not in policy:
-        return False
-    co = policy["candidateOrder"]
-    if not isinstance(co, list) or len(co) == 0:
-        return False
-    seen_co = set()
-    for cn in co:
-        if not isinstance(cn, str) or not cn:
-            return False
-        if cn in seen_co:
-            return False
-        seen_co.add(cn)
-
-    # Validate each candidate in request (must be a dict with expected keys)
+    # Validate each candidate in request (shape only)
     for c in cands:
         if not isinstance(c, dict):
             return False
@@ -432,7 +372,6 @@ def validate_select_structure(data: Dict[str, Any]) -> bool:
             return False
         if not isinstance(c["inventory"], list):
             return False
-        # inventory items: each must have name, bytes, sha256
         for inv in c["inventory"]:
             if not isinstance(inv, dict):
                 return False
@@ -444,22 +383,20 @@ def validate_select_structure(data: Dict[str, Any]) -> bool:
                 return False
             if not isinstance(inv["sha256"], str) or not inv["sha256"]:
                 return False
-        # totalBytes: int or null
         tb = c["totalBytes"]
         if tb is not None and (not isinstance(tb, int) or tb < 0):
             return False
-        # packageDigest: string or null
         pd = c["packageDigest"]
         if pd is not None and (not isinstance(pd, str) or not pd):
             return False
-        # reasonCodes: list of strings
         if not isinstance(c["reasonCodes"], list):
             return False
         for rc in c["reasonCodes"]:
             if not isinstance(rc, str):
                 return False
 
-    # Validate rows structure
+    # Validate rows structure only (NOT prediction values - that's per-candidate
+    # in handle_select and surfaces as INVALID_PREDICTIONS, not a 400)
     for row in rows:
         if not isinstance(row, dict):
             return False
@@ -472,19 +409,65 @@ def validate_select_structure(data: Dict[str, Any]) -> bool:
         preds = row["predictions"]
         if not isinstance(preds, dict):
             return False
-        for cname, cpred in preds.items():
+        for cname in preds.keys():
             if not isinstance(cname, str) or not cname:
                 return False
-            # predictions should be 0/1 (binary)
-            if cpred not in (0, 1):
-                return False
 
-    # Validate latencies values (finite, non-negative)
-    for cname, lat in data["latencies"].items():
+    # latencies: only check keys are strings (values validated per-candidate,
+    # falling back to null latencyMs rather than a 400)
+    for cname in data["latencies"].keys():
         if not isinstance(cname, str) or not cname:
             return False
-        if not isinstance(lat, (int, float)) or lat < 0:
+
+    return True
+
+
+def validate_policy(policy: Dict[str, Any]) -> bool:
+    """
+    Field-level validation of policy contents. Failure here does NOT
+    produce a 400; instead every candidate result gets INVALID_POLICY.
+    """
+    if "maxBytes" not in policy:
+        return False
+    mb = policy["maxBytes"]
+    if not isinstance(mb, int) or isinstance(mb, bool) or mb < 0:
+        return False
+
+    if "aggregateFloor" not in policy:
+        return False
+    af = policy["aggregateFloor"]
+    if not isinstance(af, (int, float)) or isinstance(af, bool) or af < 0 or af > 1:
+        return False
+
+    if "requiredSlices" not in policy:
+        return False
+    rs = policy["requiredSlices"]
+    if not isinstance(rs, dict):
+        return False
+    for sname, sfloor in rs.items():
+        if not isinstance(sname, str) or not sname:
             return False
+        if not isinstance(sfloor, (int, float)) or isinstance(sfloor, bool) or sfloor < 0 or sfloor > 1:
+            return False
+
+    if "maxLatencyMs" not in policy:
+        return False
+    ml = policy["maxLatencyMs"]
+    if not isinstance(ml, (int, float)) or isinstance(ml, bool) or ml < 0:
+        return False
+
+    if "candidateOrder" not in policy:
+        return False
+    co = policy["candidateOrder"]
+    if not isinstance(co, list) or len(co) == 0:
+        return False
+    seen_co = set()
+    for cn in co:
+        if not isinstance(cn, str) or not cn:
+            return False
+        if cn in seen_co:
+            return False
+        seen_co.add(cn)
 
     return True
 
@@ -501,7 +484,7 @@ def recompute_manifest_from_original_files(
 
 
 def handle_select(data: Dict[str, Any]) -> Response:
-    # Validate structure
+    # Validate structure (shape only; see validate_select_structure docstring)
     if not validate_select_structure(data):
         return JSONResponse(
             status_code=400,
@@ -514,11 +497,17 @@ def handle_select(data: Dict[str, Any]) -> Response:
     latencies = data["latencies"]
     rows = data["rows"]
 
+    # Field-level policy validity; failure -> INVALID_POLICY per candidate, not 400
+    policy_valid = validate_policy(policy)
+
     # Check freezeId exists
     if freeze_id not in FROZEN_STORE:
         # All candidates are NOT_FROZEN
         results = []
         for c in req_candidates:
+            codes = ["NOT_FROZEN"]
+            if not policy_valid:
+                codes.append("INVALID_POLICY")
             results.append({
                 "name": c["name"],
                 "aggregate": None,
@@ -526,10 +515,10 @@ def handle_select(data: Dict[str, Any]) -> Response:
                 "totalBytes": None,
                 "latencyMs": None,
                 "admitted": False,
-                "reasonCodes": sort_reason_codes(["NOT_FROZEN"])
+                "reasonCodes": sort_reason_codes(codes)
             })
-        # Order results by candidateOrder, fallback to name
-        results = order_results_by_candidate_order(results, policy["candidateOrder"])
+        candidate_order = policy.get("candidateOrder") if isinstance(policy.get("candidateOrder"), list) else []
+        results = order_results_by_candidate_order(results, candidate_order)
         response_obj = {
             "freezeId": freeze_id,
             "selected": None,
@@ -560,52 +549,50 @@ def handle_select(data: Dict[str, Any]) -> Response:
                 lineage_valid = False
                 break
 
-    # Also check candidate names match candidateOrder set
-    candidate_order = policy["candidateOrder"]
-    req_names = {c["name"] for c in req_candidates}
-    co_names = set(candidate_order)
+    # Candidate names and candidateOrder must be the same unique set
+    # (only checked when candidateOrder is itself well-formed; otherwise
+    # that's captured by INVALID_POLICY instead)
+    candidate_order = policy.get("candidateOrder")
+    if policy_valid:
+        req_names = {c["name"] for c in req_candidates}
+        co_names = set(candidate_order)
+        if req_names != co_names:
+            lineage_valid = False
+    if not isinstance(candidate_order, list):
+        candidate_order = []
 
-    if req_names != co_names:
-        # Candidate names and candidateOrder must be same unique set
-        # Treat as invalid policy/lineage; we'll mark INVALID_LINEAGE
-        lineage_valid = False
-
-    # Recompute manifest for each candidate from original files
-    # Build a map: name -> original candidate (from stored_request.candidates)
+    # Recompute manifest for each candidate from original files (PER-CANDIDATE validity)
     original_candidates_map = {}
     for oc in stored_request["candidates"]:
         original_candidates_map[oc["name"]] = oc
 
-    manifest_valid = True
+    manifest_valid_map: Dict[str, bool] = {}
     recomputed_map = {}  # name -> (inventory, totalBytes, packageDigest)
 
     for sc in stored_candidates:
         name = sc["name"]
         if name not in original_candidates_map:
-            manifest_valid = False
+            manifest_valid_map[name] = False
             recomputed_map[name] = ([], None, None)
             continue
 
         orig_cand = original_candidates_map[name]
         inv, tb, pd = recompute_manifest_from_original_files(orig_cand)
 
-        # Compare with stored
         stored_inv = sc["inventory"]
         stored_tb = sc["totalBytes"]
         stored_pd = sc["packageDigest"]
 
-        # Compare inventory (sorted by name already)
+        this_valid = True
         if compact_json(inv) != compact_json(stored_inv):
-            manifest_valid = False
+            this_valid = False
         if tb != stored_tb:
-            manifest_valid = False
+            this_valid = False
         if pd != stored_pd:
-            manifest_valid = False
+            this_valid = False
 
+        manifest_valid_map[name] = this_valid
         recomputed_map[name] = (inv, tb, pd)
-
-    # Policy validity: already structurally validated; we assume valid here.
-    # But we must check candidateOrder vs candidate names already done above.
 
     # Build results per candidate
     results = []
@@ -615,11 +602,14 @@ def handle_select(data: Dict[str, Any]) -> Response:
         name = c["name"]
         reason_codes: List[str] = []
 
-        # Start with lineage/manifest checks
+        if not policy_valid:
+            reason_codes.append("INVALID_POLICY")
+
         if not lineage_valid:
             reason_codes.append("INVALID_LINEAGE")
 
-        if not manifest_valid:
+        candidate_manifest_valid = manifest_valid_map.get(name, False)
+        if not candidate_manifest_valid:
             reason_codes.append("INVALID_MANIFEST")
 
         # Check if candidate is frozen
@@ -627,7 +617,7 @@ def handle_select(data: Dict[str, Any]) -> Response:
         if stored_cand is None or stored_cand["status"] != "frozen":
             reason_codes.append("NOT_FROZEN")
 
-        # Predictions validity
+        # Predictions validity (per-candidate; binary value check lives here)
         predictions_valid = True
         for row in rows:
             preds = row["predictions"]
@@ -635,7 +625,7 @@ def handle_select(data: Dict[str, Any]) -> Response:
                 predictions_valid = False
                 break
             pval = preds[name]
-            if pval not in (0, 1):
+            if pval not in (0, 1) or isinstance(pval, bool):
                 predictions_valid = False
                 break
 
@@ -666,59 +656,61 @@ def handle_select(data: Dict[str, Any]) -> Response:
                 slice_groups.setdefault(s, []).append(row)
 
             slices_dict = {}
-            required_slices = policy["requiredSlices"]
+            required_slices = policy.get("requiredSlices") if policy_valid else {}
+            required_slices = required_slices if isinstance(required_slices, dict) else {}
             for sname, sfloor in required_slices.items():
                 if sname not in slice_groups:
-                    # Missing slice
+                    # Missing slice; handled below via MISSING_SLICE
                     pass
                 else:
                     srows = slice_groups[sname]
                     smatches = sum(1 for r in srows if r["predictions"][name] == r["label"])
                     sacc = round(smatches / len(srows), 12) if srows else 0.0
                     slices_dict[sname] = sacc
-            slices = slices_dict if slices_dict else None
+            # Empty dict is a valid (non-null) result, not None
+            slices = slices_dict
 
         # totalBytes from recomputed manifest
         inv, tb, pd = recomputed_map.get(name, ([], None, None))
         total_bytes = tb
 
-        # latencyMs from latencies dict
-        if name in latencies:
-            latency_ms = latencies[name]
+        # latencyMs from latencies dict; validated here, null if unusable
+        raw_lat = latencies.get(name)
+        if isinstance(raw_lat, (int, float)) and not isinstance(raw_lat, bool) and raw_lat >= 0:
+            latency_ms = raw_lat
         else:
-            latency_ms = None  # cannot validate
+            latency_ms = None
 
-        # Apply policy checks and add reason codes
-        max_bytes = policy["maxBytes"]
-        agg_floor = policy["aggregateFloor"]
-        required_slices = policy["requiredSlices"]
-        max_latency = policy["maxLatencyMs"]
+        # Apply policy checks and add reason codes (only if policy itself is valid)
+        if policy_valid:
+            max_bytes = policy["maxBytes"]
+            agg_floor = policy["aggregateFloor"]
+            required_slices = policy["requiredSlices"]
+            max_latency = policy["maxLatencyMs"]
 
-        # Aggregate floor
-        if aggregate is not None and aggregate < agg_floor:
-            reason_codes.append("AGGREGATE_FLOOR")
+            # Aggregate floor
+            if aggregate is not None and aggregate < agg_floor:
+                reason_codes.append("AGGREGATE_FLOOR")
 
-        # Required slices
-        if slices is not None:
-            for sname, sfloor in required_slices.items():
-                if sname not in slices:
-                    reason_codes.append(f"MISSING_SLICE:{sname}")
-                elif slices[sname] < sfloor:
-                    reason_codes.append(f"SLICE_FLOOR:{sname}")
-        else:
-            # If slices is None (predictions invalid), we already have INVALID_PREDICTIONS
-            pass
+            # Required slices
+            if slices is not None:
+                for sname, sfloor in required_slices.items():
+                    if sname not in slices:
+                        reason_codes.append(f"MISSING_SLICE:{sname}")
+                    elif slices[sname] < sfloor:
+                        reason_codes.append(f"SLICE_FLOOR:{sname}")
 
-        # Size limit
-        if total_bytes is not None and total_bytes > max_bytes:
-            reason_codes.append("SIZE_LIMIT")
+            # Size limit
+            if total_bytes is not None and total_bytes > max_bytes:
+                reason_codes.append("SIZE_LIMIT")
 
-        # Latency limit
-        if latency_ms is not None and latency_ms > max_latency:
-            reason_codes.append("LATENCY_LIMIT")
+            # Latency limit
+            if latency_ms is not None and latency_ms > max_latency:
+                reason_codes.append("LATENCY_LIMIT")
 
         # Determine admitted
         admitted = (
+            policy_valid and
             len(reason_codes) == 0 and
             stored_cand is not None and
             stored_cand["status"] == "frozen" and
