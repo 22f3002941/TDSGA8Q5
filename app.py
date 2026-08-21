@@ -118,7 +118,9 @@ def validate_freeze_input(data: Dict[str, Any]) -> bool:
     if not isinstance(tok_digest, str) or not tok_digest:
         return False
 
-    # allowedUnsupportedReasons: list of non-empty unique strings (may be empty)
+    # allowedUnsupportedReasons: list of non-empty unique strings.
+    # The array itself MAY be empty (see spec example: "allowedUnsupportedReasons": [])
+    # — only the items inside it, if any, must be non-empty and unique.
     allowed = data.get("allowedUnsupportedReasons")
     if not isinstance(allowed, list):
         return False
