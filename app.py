@@ -868,9 +868,72 @@ def order_results_by_candidate_order(
 # -------------------------
 
 
+def _safe_log_summary(payload: Any) -> str:
+    """
+    Build a compact, safe-to-log summary of an incoming request: enough
+    structure to diagnose validation decisions (candidate names, digests,
+    policy, row/prediction shape) without dumping large file contents.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return f"<non-dict payload: {type(payload).__name__}>"
+
+        phase = payload.get("phase")
+        summary: Dict[str, Any] = {"phase": phase}
+
+        if phase == "freeze":
+            summary["freezeId"] = payload.get("freezeId")
+            summary["calibrationDigest"] = payload.get("calibrationDigest")
+            summary["tokenizerDigest"] = payload.get("tokenizerDigest")
+            summary["allowedUnsupportedReasons"] = payload.get("allowedUnsupportedReasons")
+            cands = payload.get("candidates")
+            if isinstance(cands, list):
+                cand_summaries = []
+                for c in cands:
+                    if not isinstance(c, dict):
+                        cand_summaries.append({"<not-a-dict>": repr(c)[:80]})
+                        continue
+                    files = c.get("files")
+                    file_keys = list(files.keys()) if isinstance(files, dict) else f"<{type(files).__name__}>"
+                    cand_summaries.append({
+                        "name": c.get("name"),
+                        "loadable": c.get("loadable"),
+                        "calibrationDigest": c.get("calibrationDigest"),
+                        "tokenizerDigest": c.get("tokenizerDigest"),
+                        "unsupportedReason": c.get("unsupportedReason"),
+                        "file_keys": file_keys,
+                    })
+                summary["candidates"] = cand_summaries
+                summary["candidate_count"] = len(cands)
+            else:
+                summary["candidates"] = f"<{type(cands).__name__}>"
+
+        elif phase == "select":
+            summary["freezeId"] = payload.get("freezeId")
+            cands = payload.get("candidates")
+            if isinstance(cands, list):
+                summary["candidate_names"] = [c.get("name") if isinstance(c, dict) else repr(c)[:40] for c in cands]
+            else:
+                summary["candidates"] = f"<{type(cands).__name__}>"
+            summary["policy"] = payload.get("policy")
+            summary["latencies"] = payload.get("latencies")
+            rows = payload.get("rows")
+            if isinstance(rows, list):
+                summary["row_count"] = len(rows)
+                summary["first_row"] = rows[0] if rows else None
+            else:
+                summary["rows"] = f"<{type(rows).__name__}>"
+        else:
+            summary["top_level_keys"] = list(payload.keys())
+
+        return compact_json(summary)
+    except Exception as e:
+        return f"<error building summary: {e!r}>"
+
+
 @app.post("/quantize")
 async def quantize_endpoint(payload: dict):
-    logger.info("incoming request keys: %s", list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
+    logger.info("incoming payload: %s", _safe_log_summary(payload))
     try:
         phase = payload.get("phase") if isinstance(payload, dict) else None
         if phase == "freeze":
