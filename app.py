@@ -60,14 +60,24 @@ def compact_json(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
-def compute_inventory(files: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Optional[int], Optional[str]]:
+def compute_inventory(files: Any) -> Tuple[List[Dict[str, Any]], Optional[int], Optional[str]]:
     """
     Given {filename: utf8_text}, compute:
       - inventory list sorted by filename, each item: {"name": ..., "bytes": ..., "sha256": ...}
       - totalBytes (sum) or None if invalid
       - packageDigest = SHA-256(compact JSON of inventory) or None if invalid
+
+    Per spec: "Each candidate has a non-empty object of unique filenames mapped
+    to UTF-8 strings." A missing/wrong-typed/empty `files`, or any filename/content
+    of the wrong type, makes the files invalid for THIS candidate (status "invalid",
+    empty inventory, null totalBytes/packageDigest) — it must not fail the whole
+    freeze request, since other well-formed candidates in the same batch still
+    need to be processed and returned normally.
     """
     try:
+        if not isinstance(files, dict) or len(files) == 0:
+            return [], None, None
+
         inventory_items = []
         for fname, content in files.items():
             if not isinstance(fname, str) or not fname:
@@ -170,6 +180,9 @@ def _validate_freeze_input_verbose(data: Dict[str, Any]) -> Tuple[bool, str]:
         if missing_c:
             return False, f"candidates[{idx}] missing key(s): {missing_c}"
 
+        # name is the only candidate field that MUST be well-formed at the
+        # whole-request level: results are keyed by name, so a missing/blank/
+        # duplicate name makes it impossible to return a coherent response at all.
         name = cand.get("name")
         if not isinstance(name, str) or not name:
             return False, f"candidates[{idx}].name invalid (value={name!r})"
@@ -177,39 +190,15 @@ def _validate_freeze_input_verbose(data: Dict[str, Any]) -> Tuple[bool, str]:
             return False, f"duplicate candidate name {name!r}"
         seen_names.add(name)
 
-        # unsupportedReason optional, but if present must be non-empty string
-        ureason = cand.get("unsupportedReason")
-        if ureason is not None:
-            if not isinstance(ureason, str) or not ureason:
-                return False, f"candidates[{idx}({name})].unsupportedReason invalid (value={ureason!r})"
-
-        # files: non-empty object of unique filenames -> UTF-8 strings
-        files = cand.get("files")
-        if not isinstance(files, dict):
-            return False, f"candidates[{idx}({name})].files is not an object (type={type(files).__name__})"
-        if len(files) == 0:
-            return False, f"candidates[{idx}({name})].files is empty"
-        seen_fnames = set()
-        for fn, fc in files.items():
-            if not isinstance(fn, str) or not fn:
-                return False, f"candidates[{idx}({name})].files has invalid filename {fn!r}"
-            if fn in seen_fnames:
-                return False, f"candidates[{idx}({name})].files duplicate filename {fn!r}"
-            seen_fnames.add(fn)
-            if not isinstance(fc, str):
-                return False, f"candidates[{idx}({name})].files[{fn!r}] value is not a string (type={type(fc).__name__})"
-
-        # loadable: bool
-        if not isinstance(cand.get("loadable"), bool):
-            return False, f"candidates[{idx}({name})].loadable is not a boolean (value={cand.get('loadable')!r}, type={type(cand.get('loadable')).__name__})"
-
-        # digests in candidate: non-empty strings
-        cd_cal = cand.get("calibrationDigest")
-        cd_tok = cand.get("tokenizerDigest")
-        if not isinstance(cd_cal, str) or not cd_cal:
-            return False, f"candidates[{idx}({name})].calibrationDigest invalid (value={cd_cal!r})"
-        if not isinstance(cd_tok, str) or not cd_tok:
-            return False, f"candidates[{idx}({name})].tokenizerDigest invalid (value={cd_tok!r})"
+        # Everything else about a candidate's CONTENT — files (missing/empty/
+        # malformed), loadable (wrong type), calibrationDigest/tokenizerDigest
+        # (wrong type/empty), unsupportedReason (wrong type/empty) — is deliberately
+        # NOT checked here. Per spec: "If a candidate's files are invalid, return
+        # an empty inventory and null totalBytes and packageDigest" — i.e. a
+        # malformed candidate degrades that ONE candidate to status "invalid"
+        # with reasonCodes, inside a normal 200 response. It must not reject the
+        # entire freeze batch just because one candidate is malformed; that logic
+        # lives in process_freeze_candidate / compute_inventory instead.
 
     return True, "ok"
 
@@ -230,19 +219,24 @@ def process_freeze_candidate(
 ) -> Dict[str, Any]:
     """
     Process a single candidate in freeze phase and return the response object.
+
+    Field CONTENT is no longer assumed valid at this point — only the keys'
+    presence and `name` were checked at the whole-request level (see
+    validate_freeze_input). A malformed files/loadable/digest/unsupportedReason
+    value degrades THIS candidate to status "invalid" with reasonCodes
+    ["INVALID_INPUT"] rather than propagating an exception or having already
+    rejected the whole freeze batch upstream.
     """
     name = cand["name"]
-    files = cand["files"]
-    loadable = cand["loadable"]
-    cal_digest = cand["calibrationDigest"]
-    tok_digest = cand["tokenizerDigest"]
+    files = cand.get("files")
+    loadable = cand.get("loadable")
+    cal_digest = cand.get("calibrationDigest")
+    tok_digest = cand.get("tokenizerDigest")
     u_reason = cand.get("unsupportedReason")  # may be None
 
-    # Compute inventory, totalBytes, packageDigest
+    # Compute inventory, totalBytes, packageDigest (handles missing/empty/
+    # malformed `files` internally, returning (?, None, None) if invalid)
     inventory, total_bytes, pkg_digest = compute_inventory(files)
-
-    reason_codes: List[str] = []
-    status: str = "frozen"
 
     # If files invalid (inventory empty and total_bytes None), mark invalid
     if total_bytes is None:
@@ -254,6 +248,41 @@ def process_freeze_candidate(
             "packageDigest": None,
             "reasonCodes": sort_reason_codes(["INVALID_INPUT"])
         }
+
+    # Beyond files, check the remaining fields are well-formed. Any
+    # malformation here is also INVALID_INPUT — but since files WERE valid,
+    # the real computed inventory/totalBytes/packageDigest are still returned
+    # (only files-invalidity nulls those out, per spec).
+    if not isinstance(loadable, bool):
+        return {
+            "name": name,
+            "status": "invalid",
+            "inventory": inventory,
+            "totalBytes": total_bytes,
+            "packageDigest": pkg_digest,
+            "reasonCodes": sort_reason_codes(["INVALID_INPUT"])
+        }
+    if not isinstance(cal_digest, str) or not cal_digest or not isinstance(tok_digest, str) or not tok_digest:
+        return {
+            "name": name,
+            "status": "invalid",
+            "inventory": inventory,
+            "totalBytes": total_bytes,
+            "packageDigest": pkg_digest,
+            "reasonCodes": sort_reason_codes(["INVALID_INPUT"])
+        }
+    if u_reason is not None and (not isinstance(u_reason, str) or not u_reason):
+        return {
+            "name": name,
+            "status": "invalid",
+            "inventory": inventory,
+            "totalBytes": total_bytes,
+            "packageDigest": pkg_digest,
+            "reasonCodes": sort_reason_codes(["INVALID_INPUT"])
+        }
+
+    reason_codes: List[str] = []
+    status: str = "frozen"
 
     # Determine status and reason codes
     if u_reason is not None:
