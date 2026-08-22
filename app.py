@@ -378,130 +378,87 @@ def handle_freeze(data: Dict[str, Any]) -> Response:
 
 def validate_select_structure(data: Dict[str, Any]) -> bool:
     """
-    Minimal structural validation for select input.
-    Returns True if valid, else False. Logs the precise failing check.
+    Validate only the request structure that must produce HTTP 400.
+
+    Field-level candidate, prediction, latency, and policy validity are
+    handled by handle_select() and represented through reasonCodes.
     """
     ok, reason = _validate_select_structure_verbose(data)
+
     if not ok:
         logger.info("select rejected: %s", reason)
+
     return ok
 
 
-def _validate_select_structure_verbose(data: Dict[str, Any]) -> Tuple[bool, str]:
-    """
-    Per spec: a select request without array `candidates` and `rows` plus an
-    object `policy` returns 400. `latencies` is NOT named in that 400 trigger,
-    so its absence is tolerated here (treated as {} downstream) — only its
-    type is checked if present. Everything else (policy field values,
-    prediction values, latency values) is validated per-candidate inside
-    handle_select and surfaces as reason codes, not as a 400.
-    """
+def _validate_select_structure_verbose(
+    data: Dict[str, Any]
+) -> Tuple[bool, str]:
+
     if not isinstance(data, dict):
         return False, "body is not a JSON object"
+
     if data.get("phase") != "select":
         return False, f"phase != 'select' (got {data.get('phase')!r})"
 
-    required_keys = ["freezeId", "candidates", "policy", "rows"]
+    # Required top-level structure
+    required_keys = [
+        "freezeId",
+        "candidates",
+        "policy",
+        "rows",
+    ]
+
     missing = [k for k in required_keys if k not in data]
+
     if missing:
         return False, f"missing top-level key(s): {missing}"
 
-    # freezeId: non-empty string
-    if not isinstance(data["freezeId"], str) or not data["freezeId"]:
-        return False, f"freezeId invalid (value={data['freezeId']!r})"
+    # freezeId must be a non-empty string
+    freeze_id = data["freezeId"]
 
-    # candidates: array (per spec's literal 400 wording, just "array" — not
-    # explicitly required to be non-empty, but an empty array can never
-    # equal a non-empty frozen response, so it's kept for sanity here;
-    # relax this line first if this turns out to be the rejection point)
-    cands = data["candidates"]
-    if not isinstance(cands, list):
-        return False, f"candidates is not an array (type={type(cands).__name__})"
-    if len(cands) == 0:
-        return False, "candidates array is empty"
+    if not isinstance(freeze_id, str) or not freeze_id:
+        return False, f"freezeId invalid (value={freeze_id!r})"
 
-    # policy: object
+    # candidates must be an array.
+    # Do NOT require it to be non-empty.
+    candidates = data["candidates"]
+
+    if not isinstance(candidates, list):
+        return False, (
+            f"candidates is not an array "
+            f"(type={type(candidates).__name__})"
+        )
+
+    # policy must be an object.
+    # Do not validate policy fields here.
     policy = data["policy"]
+
     if not isinstance(policy, dict):
-        return False, f"policy is not an object (type={type(policy).__name__})"
+        return False, (
+            f"policy is not an object "
+            f"(type={type(policy).__name__})"
+        )
 
-    # rows: array
+    # rows must be an array.
+    # Do NOT require it to be non-empty.
     rows = data["rows"]
+
     if not isinstance(rows, list):
-        return False, f"rows is not an array (type={type(rows).__name__})"
-    if len(rows) == 0:
-        return False, "rows array is empty"
+        return False, (
+            f"rows is not an array "
+            f"(type={type(rows).__name__})"
+        )
 
-    # latencies: optional; if present, must be an object
-    latencies_val = data.get("latencies", {})
-    if not isinstance(latencies_val, dict):
-        return False, f"latencies is not an object (type={type(latencies_val).__name__})"
-
-    # Validate each candidate in request (shape only)
-    for idx, c in enumerate(cands):
-        if not isinstance(c, dict):
-            return False, f"candidates[{idx}] is not an object"
-        c_req_keys = ["name", "status", "inventory", "totalBytes", "packageDigest", "reasonCodes"]
-        missing_c = [k for k in c_req_keys if k not in c]
-        if missing_c:
-            return False, f"candidates[{idx}] missing key(s): {missing_c}"
-        if not isinstance(c["name"], str) or not c["name"]:
-            return False, f"candidates[{idx}].name invalid (value={c['name']!r})"
-        if not isinstance(c["status"], str) or c["status"] not in ("frozen", "unsupported", "invalid"):
-            return False, f"candidates[{idx}({c['name']})].status invalid (value={c['status']!r})"
-        if not isinstance(c["inventory"], list):
-            return False, f"candidates[{idx}({c['name']})].inventory is not an array"
-        for j, inv in enumerate(c["inventory"]):
-            if not isinstance(inv, dict):
-                return False, f"candidates[{idx}({c['name']})].inventory[{j}] is not an object"
-            missing_inv = [k for k in ("name", "bytes", "sha256") if k not in inv]
-            if missing_inv:
-                return False, f"candidates[{idx}({c['name']})].inventory[{j}] missing key(s): {missing_inv}"
-            if not isinstance(inv["name"], str) or not inv["name"]:
-                return False, f"candidates[{idx}({c['name']})].inventory[{j}].name invalid"
-            if not isinstance(inv["bytes"], int) or isinstance(inv["bytes"], bool) or inv["bytes"] < 0:
-                return False, f"candidates[{idx}({c['name']})].inventory[{j}].bytes invalid (value={inv['bytes']!r})"
-            if not isinstance(inv["sha256"], str) or not inv["sha256"]:
-                return False, f"candidates[{idx}({c['name']})].inventory[{j}].sha256 invalid"
-        tb = c["totalBytes"]
-        if tb is not None and (not isinstance(tb, int) or isinstance(tb, bool) or tb < 0):
-            return False, f"candidates[{idx}({c['name']})].totalBytes invalid (value={tb!r})"
-        pd = c["packageDigest"]
-        if pd is not None and (not isinstance(pd, str) or not pd):
-            return False, f"candidates[{idx}({c['name']})].packageDigest invalid (value={pd!r})"
-        if not isinstance(c["reasonCodes"], list):
-            return False, f"candidates[{idx}({c['name']})].reasonCodes is not an array"
-        for rc in c["reasonCodes"]:
-            if not isinstance(rc, str):
-                return False, f"candidates[{idx}({c['name']})].reasonCodes has non-string entry {rc!r}"
-
-    # Validate rows structure only (NOT prediction values - that's per-candidate
-    # in handle_select and surfaces as INVALID_PREDICTIONS, not a 400)
-    for ridx, row in enumerate(rows):
-        if not isinstance(row, dict):
-            return False, f"rows[{ridx}] is not an object"
-        missing_row = [k for k in ("label", "slice", "predictions") if k not in row]
-        if missing_row:
-            return False, f"rows[{ridx}] missing key(s): {missing_row}"
-        if not isinstance(row["label"], int):
-            return False, f"rows[{ridx}].label is not an int (value={row['label']!r})"
-        if not isinstance(row["slice"], str) or not row["slice"]:
-            return False, f"rows[{ridx}].slice invalid (value={row['slice']!r})"
-        preds = row["predictions"]
-        if not isinstance(preds, dict):
-            return False, f"rows[{ridx}].predictions is not an object (type={type(preds).__name__})"
-        for cname in preds.keys():
-            if not isinstance(cname, str) or not cname:
-                return False, f"rows[{ridx}].predictions has invalid key {cname!r}"
-
-    # latencies: only check keys are strings (values validated per-candidate,
-    # falling back to null latencyMs rather than a 400)
-    for cname in latencies_val.keys():
-        if not isinstance(cname, str) or not cname:
-            return False, f"latencies has invalid key {cname!r}"
+    # latencies is optional.
+    # If supplied, it must be an object.
+    if "latencies" in data and not isinstance(data["latencies"], dict):
+        return False, (
+            f"latencies is not an object "
+            f"(type={type(data['latencies']).__name__})"
+        )
 
     return True, "ok"
-
 
 def validate_policy(policy: Dict[str, Any]) -> bool:
     """
